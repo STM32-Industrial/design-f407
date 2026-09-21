@@ -1,11 +1,14 @@
 #include "ota.h"
 #include "crc32.h"
 #include "esp8266.h"
+#include "wifi_cfg.h"   /* MQTT_BROKER_IP: MQTT重连用 */
 #include "delay.h"
 #include "stm32f4xx.h"
 #include "stdio.h"
 #include "string.h"
 #include "stddef.h"
+
+extern u8 mqtt_connected;   /* main.c: MQTT连接标志 */
 
 /* ============================================================
  * App 端 OTA 接收
@@ -92,7 +95,10 @@ static void flash_erase_range(u32 start, u32 end)
     FLASH_ClearFlag(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
                     FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
     for (s = s0; s <= s1; s++) {
-        FLASH_EraseSector(s, VoltageRange_3);
+        /* 注意: FLASH_EraseSector 参数必须用 FLASH_Sector_x 枚举(=扇区索引<<3),
+           直接传索引 8 会按 SNB=8>>3=1 去擦扇区1(App区)!! 实测把App向量表擦光,
+           暂存区却原封不动, 板子进恢复模式。 */
+        FLASH_EraseSector(s << 3, VoltageRange_3);
     }
     FLASH_Lock();
 }
@@ -239,9 +245,13 @@ static u8 ota_take_msg(char *topic, u16 tsz, char *pay, u16 psz)
         t0 = ++p0;
         while (p0 < e && ESP8266_RX_BUF[p0] != '"') p0++;
         t1 = p0;
-        while (p0 < e && ESP8266_RX_BUF[p0] != ',') p0++;  /* 长度字段后的逗号 */
-        if (p0 < e && t1 > t0) {
-            p1 = p0 + 1;                                    /* payload 起点 */
+        p0++;                                           /* 跳过topic结束引号 */
+        while (p0 < e && ESP8266_RX_BUF[p0] != ',') p0++;   /* topic后的逗号 */
+        p0++;                                           /* 跳过逗号, 进入长度字段 */
+        while (p0 < e && ESP8266_RX_BUF[p0] >= '0' && ESP8266_RX_BUF[p0] <= '9')
+            p0++;                                       /* 跳过长度字段数字 */
+        if (p0 < e && ESP8266_RX_BUF[p0] == ',' && t1 > t0) {
+            p1 = p0 + 1;                                /* payload 真正起点(跳过长度字段) */
             j = 0;
             for (i = t0; i < t1 && j < tsz - 1; i++) topic[j++] = ESP8266_RX_BUF[i];
             topic[j] = 0;
@@ -258,14 +268,140 @@ static u8 ota_take_msg(char *topic, u16 tsz, char *pay, u16 psz)
 
 /* ==================== 应答 ==================== */
 
+/* MQTT连接在擦除Flash期间失效。擦除大电流可能导致ESP-01S供电波动,
+ * 其WiFi/MQTT子系统可能异常(模块AT正常但MQTT连不上)。
+ * 恢复策略: 先软重连(配置+断开+连接), 连续失败3次则硬重启ESP(AT+RST)
+ * 彻底清状态, 再走 等ready->等WiFi->配置MQTT->连接->订阅 完整流程。 */
+static void ota_esp_reconnect_mqtt(void)
+{
+    int i;
+    for (i = 0; i < 8; i++)
+    {
+        wdg_wide();                   /* 刷新32.8秒宽限, 防止重试期间被IWDG复位 */
+
+        /* 前3次软重连; 从第4次起每次硬重启ESP清异常状态 */
+        if (i >= 3)
+        {
+            int r;
+            printf("[OTA] 软重连无效, 硬重启ESP(%d)...\r\n", i - 2);
+            esp8266_clear_rxbuf();
+            esp8266_send_cmd("AT+RST");
+            delay_ms(3000);           /* 等模块重启 */
+            /* 等ready, 多试几次(供电崩溃后模块恢复慢) */
+            for (r = 0; r < 5; r++)
+            {
+                esp8266_clear_rxbuf();
+                if (esp8266_wait_string("ready", 2000)) break;
+            }
+            if (r >= 5)
+            {
+                printf("[OTA] 等ready超时, 继续等...\r\n");
+                delay_ms(2000);
+                continue;
+            }
+            /* 等WiFi自动重连(模块保存过AP配置) */
+            {
+                int t;
+                for (t = 0; t < 25; t++) {
+                    esp8266_clear_rxbuf();
+                    esp8266_send_cmd("AT+CIFSR");
+                    if (esp8266_wait_string("STAIP", 1000)) break;
+                    delay_ms(1000);
+                }
+                if (t >= 25) { printf("[OTA] WiFi恢复超时\r\n"); continue; }
+                printf("[OTA] ESP已重启, WiFi已恢复\r\n");
+            }
+        }
+
+        /* 1. 等ESP活着 */
+        esp8266_clear_rxbuf();
+        esp8266_send_cmd("AT");
+        if (!esp8266_wait_string("OK", 1000)) { delay_ms(2000); continue; }
+
+        /* 2. WiFi断开则重连 */
+        esp8266_clear_rxbuf();
+        esp8266_send_cmd("AT+CIFSR");
+        if (!esp8266_wait_string("STAIP", 1000))
+        {
+            printf("[OTA] WiFi已断, 重连 %s ...\r\n", WIFI_SSID);
+            esp8266_clear_rxbuf();
+            esp8266_send_cmd("AT+CWJAP=\"" WIFI_SSID "\",\"" WIFI_PWD "\"");
+            if (!esp8266_wait_string("GOT IP", 10000))
+            {
+                esp8266_clear_rxbuf();
+                printf("[OTA] WiFi重连失败(%d)...\r\n", i + 1);
+                delay_ms(2000);
+                continue;
+            }
+            printf("[OTA] WiFi已恢复\r\n");
+        }
+
+        /* 3. 重新配置MQTT客户端(重启后配置会丢) */
+        esp8266_clear_rxbuf();
+        esp8266_send_cmd("AT+MQTTUSERCFG=0,1,\"F407_Gateway\",\"\",\"\",0,0,\"\"");
+        if (!esp8266_wait_string("OK", 1000))
+        {
+            printf("[OTA] MQTTUSERCFG失败, ESP响应: ");
+            esp8266_print_rxbuf();
+        }
+
+        /* 4. 断开旧MQTT, 重连 */
+        esp8266_clear_rxbuf();
+        esp8266_send_cmd("AT+MQTTDISC=0");
+        esp8266_wait_string("OK", 1000);
+        esp8266_clear_rxbuf();
+        esp8266_send_cmd("AT+MQTTCONN=0,\"" MQTT_BROKER_IP "\",1883,0");
+        if (esp8266_wait_string("CONNECT", 5000) || esp8266_wait_string("OK", 1000))
+        {
+            esp8266_clear_rxbuf();
+            esp8266_send_cmd("AT+MQTTSUB=0,\"" OTA_TOPIC "\",0");
+            esp8266_wait_string("OK", 1000);
+            mqtt_connected = 1;
+            printf("[OTA] MQTT重连成功\r\n");
+            return;
+        }
+        esp8266_clear_rxbuf();
+        printf("[OTA] MQTT重连失败(%d), ESP响应: ", i + 1);
+        esp8266_print_rxbuf();
+        delay_ms(2000);
+    }
+    printf("[OTA] 重连放弃, 等上位机重发开始帧\r\n");
+}
+
 static void ota_pub_ack(const char *msg)
 {
-    char cmd[96];
+    char cmd[128];
+    char esc[96];
+    const char *s = msg;
+    char *d = esc;
+    int attempt;
+    u8 ok = 0;
 
-    sprintf(cmd, "AT+MQTTPUB=0,\"" OTA_ACK_TOPIC "\",\"%s\",0,0", msg);
-    esp8266_clear_rxbuf();
-    esp8266_send_cmd(cmd);
-    esp8266_wait_string("OK", 1000);
+    /* ESP AT固件: MQTT payload 内的逗号必须转义成 \, 否则会被解析成参数分隔符,
+       命令返回 ERROR(实测: "R,BEGIN" 未转义 -> ERROR, 确认根本发不出去!) */
+    while (*s && (d - esc) < (int)sizeof(esc) - 3)
+    {
+        if (*s == ',') { *d++ = '\\'; *d++ = ','; }
+        else *d++ = *s;
+        s++;
+    }
+    *d = 0;
+
+    sprintf(cmd, "AT+MQTTPUB=0,\"" OTA_ACK_TOPIC "\",\"%s\",0,0", esc);
+    for (attempt = 0; attempt < 6 && !ok; attempt++)
+    {
+        wdg_wide();                   /* 刷新32.8秒宽限: 整段下载期间不能让IWDG复位 */
+        esp8266_clear_rxbuf();          /* 发送前清残留, 避免旧的"OK"误判 */
+        esp8266_send_cmd(cmd);
+        ok = esp8266_wait_string("OK", 2000);
+        esp8266_clear_rxbuf();          /* 清掉本条AT命令回显+OK残留, 防缓冲堆积 */
+        if (!ok)
+        {
+            printf("[OTA] ACK失败(%d): %s, 重连MQTT再试\r\n", attempt + 1, msg);
+            ota_esp_reconnect_mqtt();
+        }
+    }
+    printf("[OTA] ACK: %s -> %s\r\n", msg, ok ? "OK" : "FAIL");
 }
 
 static void ota_ack_ok(u32 seq)
@@ -328,13 +464,24 @@ static int hex2bin(const char *h, u8 *out, u32 n)
     return 0;
 }
 
-/* 擦除暂存区: 槽位B 全部 + 元数据区所在扇区 (擦完元数据也是干净的) */
+/* 擦除暂存区: 槽位B 全部 + 元数据区所在扇区 (擦完元数据也是干净的)
+ * 注意: 这里不能 wdg_normal()! 擦除后还要发ACK/可能MQTT重连(几十秒),
+ * 若立即恢复4秒超时, mqtt_task阻塞期间IWDG会超时复位(实测踩坑)。
+ * IWDG宽限期(32.8秒)在下载结束(E帧/A帧)才恢复。 */
 static int ota_erase_staging(void)
 {
+    /* 擦除4个扇区持续数秒, F407擦Flash时电流猛增可能让ESP-01S供电崩溃(AT都不响应)。
+       先断开MQTT降低ESP负载, 减小擦除期间的供电压力, 提高存活率。 */
+    printf("[OTA] 断开MQTT, 准备擦除(降低ESP负载)...\r\n");
+    esp8266_clear_rxbuf();
+    esp8266_send_cmd("AT+MQTTDISC=0");
+    esp8266_wait_string("OK", 1000);
+    esp8266_clear_rxbuf();
+    delay_ms(500);
+
     printf("[OTA] 擦除暂存区(槽位B + 元数据扇区), 约需数秒...\r\n");
     wdg_wide();
     flash_erase_range(STAGING_ADDR, STAGING_ADDR + APP_MAX_SIZE);
-    wdg_normal();
     printf("[OTA] 擦除完成\r\n");
     return 0;
 }
@@ -353,6 +500,11 @@ static void ota_handle(const char *p)
             ota_pub_ack("R,ERR,BS");
             return;
         }
+        /* 重复的开始帧(上位机握手超时重发): 若已在接收同一固件, 直接重新确认, 不重复擦除 */
+        if (s_active && s_size == size && s_crc == crc && s_ver == ver) {
+            ota_pub_ack("R,BEGIN");
+            return;
+        }
         s_active = 0;
         s_size = size;
         s_crc  = crc;
@@ -362,6 +514,9 @@ static void ota_handle(const char *p)
                (unsigned)size, (unsigned)crc, (unsigned)ver);
         ota_erase_staging();
         s_active = 1;
+        /* 擦除4个扇区持续数秒, F407擦Flash时电流猛增可能拉低3.3V,
+           ESP-01S可能因此重启并重连WiFi/MQTT, 等它稳定再回确认 */
+        delay_ms(2000);
         ota_pub_ack("R,BEGIN");
     }
     else if (p[0] == 'D' && p[1] == ',') {
@@ -395,6 +550,7 @@ static void ota_handle(const char *p)
                (unsigned)s_crc, (unsigned)calc);
         if (calc != s_crc) {
             s_active = 0;
+            wdg_normal();            /* 下载结束, 恢复正常看门狗 */
             sprintf(m, "R,FAIL,%08X", (unsigned)calc);
             ota_pub_ack(m);
             printf("[OTA] CRC不匹配, 丢弃(请重发)\r\n");
@@ -402,6 +558,7 @@ static void ota_handle(const char *p)
         }
         meta_write_ready();          /* magic/size/crc/ver + ready_flag */
         s_active = 0;
+        wdg_normal();                /* 下载结束, 恢复正常看门狗 */
         printf("[OTA] 校验通过, 元数据已写入 ready_flag\r\n");
         ota_pub_ack("R,DONE");
         delay_ms(300);
@@ -411,6 +568,7 @@ static void ota_handle(const char *p)
     }
     else if (p[0] == 'A') {
         s_active = 0;
+        wdg_normal();                /* 下载结束, 恢复正常看门狗 */
         printf("[OTA] 上位机放弃本次升级\r\n");
         ota_pub_ack("R,ABORT");
     }

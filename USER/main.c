@@ -100,7 +100,7 @@ void mqtt_connect(void)
     u8  got = 0;
     u16 t;
     // 各步骤结果 (用于最后一行汇总, 避免串口被刷屏时看不到中间日志)
-    u8  r_reset = 0, r_at = 0, r_sta = 0, r_wifi = 0, r_cfg = 0, r_conn = 0, r_sub = 0;
+    u8  r_reset = 0, r_at = 0, r_sta = 0, r_wifi = 0, r_cfg = 0, r_conn = 0, r_sub = 0, r_ota = 0;
 
     printf("\r\n========== ESP-01S WiFi/MQTT 连接 ==========\r\n");
     delay_ms(1500);           // 等待ESP-01S上电启动
@@ -194,27 +194,56 @@ void mqtt_connect(void)
         esp8266_print_rxbuf();
     }
 
-    // 6. 订阅控制主题 (接收QT上位机下发的阀门控制指令)
+    // 6. 订阅 OTA 升级主题 (接收QT上位机下发的固件升级指令)
+    // 注意: ESP-01S AT固件对 "#" 通配符订阅返回OK但不生效, 且多主题订阅不可靠;
+    //       当前只订阅 ota/fw 单主题, 优先打通OTA (QT阀门按钮暂不可用, 屏幕阀门按钮不受影响)
     if (mqtt_connected)
     {
         esp8266_clear_rxbuf();
-        esp8266_send_cmd("AT+MQTTSUB=0,\"" MQTT_CTRL_TOPIC "\",0");
+        esp8266_send_cmd("AT+MQTTSUB=0,\"" OTA_TOPIC "\",0");
         r_sub = esp8266_wait_string("OK", 1000);
         if (r_sub)
-            printf("[6] MQTT 订阅成功\r\n");
+            printf("[6] OTA 主题订阅成功\r\n");
         else
         {
-            printf("[6] MQTT 订阅失败! RX_CNT=%d\r\n", (int)ESP8266_RX_CNT);
+            printf("[6] OTA 订阅失败! RX_CNT=%d\r\n", (int)ESP8266_RX_CNT);
             esp8266_print_rxbuf();
         }
+        r_ota = r_sub;
+    }
+
+    // 7. 诊断: 打印AT固件版本 + 自发自收测试 (定位订阅无效问题, 之后删除)
+    if (mqtt_connected && r_ota)
+    {
+        printf("[7] 查询AT固件版本:\r\n");
+        esp8266_clear_rxbuf();
+        esp8266_send_cmd("AT+GMR");
+        delay_ms(800);
+        esp8266_print_rxbuf();
+
+        printf("[7] 自发自收测试: 发布一条到 ota/fw, 等它回推...\r\n");
+        esp8266_clear_rxbuf();
+        esp8266_send_cmd("AT+MQTTPUB=0,\"" OTA_TOPIC "\",\"SELFTEST\",0,0");
+        esp8266_wait_string("OK", 2000);
+        delay_ms(1500);              // 等 +MQTTSUBRECV 回推到达
+        if (esp8266_has_pending_msg())
+        {
+            printf("[7] 自发自收: 收到回推! 订阅功能正常\r\n");
+        }
+        else
+        {
+            printf("[7] 自发自收: 未收到回推! ESP-01S MQTT订阅功能异常\r\n");
+            esp8266_print_rxbuf();
+        }
+        esp8266_clear_rxbuf();       // 清理测试残留, 进入主循环
     }
 
     // ===== 汇总行: 一条看完全部步骤 (串口刷屏也能看清) =====
     printf("\r\n===== ESP-01S 连接汇总 =====\r\n");
-    printf("复位:%s  AT:%s  STA:%s  WiFi:%s  MQTT配置:%s  MQTT连接:%s  MQTT订阅:%s\r\n",
+    printf("复位:%s  AT:%s  STA:%s  WiFi:%s  MQTT配置:%s  MQTT连接:%s  OTA订阅:%s\r\n",
            r_reset ? "OK" : "--",  r_at ? "OK" : "--",  r_sta ? "OK" : "--",
            r_wifi ? "OK" : "FAIL", r_cfg ? "OK" : "--", r_conn ? "OK" : "FAIL",
-           r_sub ? "OK" : "--");
+           r_ota ? "OK" : "--");
     printf("当前连接状态: %s\r\n", mqtt_connected ? "已连接(可发布)" : "未连接");
 
     g_mqtt_busy = 0;   // 连接流程结束, 之后由 wdg_task 监督 mqtt 任务心跳
@@ -299,6 +328,36 @@ void vApplicationMallocFailedHook(void)
     while (1);
 }
 
+// ===== 诊断: 打印ESP接收缓冲的非应答内容 (纯"OK\r\n"应答不打印避免刷屏) =====
+// 定位OTA收不到消息的问题后删除
+static void rxdiag_print(void)
+{
+    static volatile u32 s_last = 0;
+    u16 i, cnt = ESP8266_RX_CNT;
+    u32 now = xTaskGetTickCount();
+
+    if (cnt == 0) return;
+    /* 纯 OK\r\n 应答垃圾: 不打印 */
+    for (i = 0; i < cnt; i++) {
+        u8 c = ESP8266_RX_BUF[i];
+        if (c != 'O' && c != 'K' && c != '\r' && c != '\n' && c != 0) break;
+    }
+    if (i == cnt) return;
+    /* MQTT推送必须立刻打印, 不受500ms限频约束(否则会被发布回显挤掉, 消息"隐形") */
+    {
+        u8 has_push = esp8266_has_pending_msg();
+        if (!has_push && (u32)(now - s_last) < 500) return;
+        s_last = now;
+    }
+
+    printf("[RX] cnt=%u: ", (unsigned)cnt);
+    for (i = 0; i < cnt; i++) {
+        u8 c = ESP8266_RX_BUF[i];
+        printf("%c", (c >= 32 && c < 127) ? c : '.');
+    }
+    printf("\r\n");
+}
+
 // ===== 任务1: MQTT (优先级1) =====
 // 上电连接 WiFi/MQTT (原先阻塞十几秒的代码挪到这里, 界面不再卡死);
 // 之后统一解析ESP收到的MQTT消息(OTA升级 / 阀门控制) + 有新机器帧时发布数据
@@ -310,12 +369,30 @@ void mqtt_task(void *p)
 
     while (1)
     {
+        static u32 s_last_resub = 0;
+
+        // 周期重新订阅 OTA 主题(每5秒): 断线重连/会话替换后订阅可能丢失, 重订一次兜底
+        // OTA下载中跳过, 避免AT应答和固件数据块抢ESP串口
+        if (mqtt_connected && !ota_is_active() &&
+            (u32)(xTaskGetTickCount() - s_last_resub) >= 5000)
+        {
+            s_last_resub = xTaskGetTickCount();
+            esp8266_send_cmd("AT+MQTTSUB=0,\"" OTA_TOPIC "\",0");
+            printf("[MQTT] 周期重订阅: %s\r\n",
+                   esp8266_wait_string("OK", 1000) ? "OK" : "失败!");
+        }
+
+        rxdiag_print();   // 诊断打印 (ESP收到的原始数据, 定位OTA问题)
+
         // 取出ESP缓冲里所有完整的MQTT消息: OTA主题自己处理, 其它主题回调 main.c
         ota_poll();
 
         // 有新机器帧则发布一次合并数据 (app_task 收到帧后置标志)
         // OTA下载期间暂停上报: 别和升级数据抢ESP模块
-        if (g_have_sensor && g_machine_updated && !ota_is_active())
+        // 缓冲里有未处理的MQTT推送(可能是OTA帧)时也暂停发布, 否则 publish 的
+        // clear_rxbuf 会把刚到达/半截的OTA帧清掉, 导致升级永远无法开始
+        if (g_have_sensor && g_machine_updated && !ota_is_active() &&
+            !esp8266_has_pending_msg())
         {
             mqtt_publish_sensor((sensor_frame_t*)&g_sensor, (machine_frame_t*)&g_machine);
             g_machine_updated = 0;
@@ -433,7 +510,9 @@ void wdg_task(void *p)
         vTaskDelay(1000);
         now = xTaskGetTickCount();
 
-        if ((g_mqtt_busy || (now - g_hb_mqtt) <= 3000) &&
+        /* OTA下载期间 mqtt_task 会长时间阻塞(擦除/ACK/MQTT重连), 心跳必然超时,
+           此时 IWDG 已由 ota 侧放宽到32.8秒兜底, 这里不再判 mqtt 卡死 */
+        if (((g_mqtt_busy || ota_is_active()) || (now - g_hb_mqtt) <= 3000) &&
             (now - g_hb_app) <= 3000 &&
             (now - g_hb_led) <= 3000)
         {

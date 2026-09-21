@@ -32,7 +32,8 @@ void boot_flash_erase(uint32_t start, uint32_t end)
     FLASH_Unlock();
     boot_flash_clear_flags();
     for (s = s0; s <= s1; s++) {
-        FLASH_EraseSector(s, VoltageRange_3);
+        /* 必须用 FLASH_Sector_x 枚举(=索引<<3), 直接传索引会擦错扇区 */
+        FLASH_EraseSector(s << 3, VoltageRange_3);
     }
     FLASH_Lock();
 }

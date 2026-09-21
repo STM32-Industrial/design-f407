@@ -64,6 +64,12 @@ void USART3_IRQHandler(void)
             ESP8266_RX_BUF[ESP8266_RX_CNT++] = res;
         }
     }
+    /* 溢出错误(ORE): 擦除Flash等长时间关中断场景下RDR会溢出, ORE置位后
+       若不读取SR+DR清除, 后续接收会永久停止(ESP数据全部收不到)。 */
+    if (USART_GetFlagStatus(USART3, USART_FLAG_ORE) != RESET)
+    {
+        (void)USART_ReceiveData(USART3);   /* 读SR(GetFlagStatus)再读DR即清ORE */
+    }
 }
 
 // 发送字符串(原样发送,不追加任何内容)
@@ -89,6 +95,24 @@ void esp8266_clear_rxbuf(void)
     u16 i;
     for (i = 0; i < ESP8266_RX_BUF_SIZE; i++) ESP8266_RX_BUF[i] = 0;
     ESP8266_RX_CNT = 0;
+}
+
+// 缓冲中是否已有未处理的 MQTT 异步推送 (+MQTTSUBRECV)
+// 用于让 mqtt_task 在接收推送期间暂停数据发布, 避免 clear_rxbuf 误清推送帧
+u8 esp8266_has_pending_msg(void)
+{
+    static const char mark[] = "+MQTTSUBRECV:";
+    u16 i, j;
+    u16 cnt = ESP8266_RX_CNT;
+
+    if (cnt < sizeof(mark) - 1) return 0;
+    for (i = 0; i + sizeof(mark) - 1 <= cnt; i++)
+    {
+        for (j = 0; j < sizeof(mark) - 1; j++)
+            if (ESP8266_RX_BUF[i + j] != (u8)mark[j]) break;
+        if (j == sizeof(mark) - 1) return 1;
+    }
+    return 0;
 }
 
 // 在接收缓冲区中查找指定字符串
