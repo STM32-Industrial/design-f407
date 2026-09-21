@@ -306,8 +306,9 @@
 /*!< Uncomment the following line if you need to relocate your vector Table in
      Internal SRAM. */
 /* #define VECT_TAB_SRAM */
-#define VECT_TAB_OFFSET  0x00 /*!< Vector Table base offset field. 
-                                   This value must be a multiple of 0x200. */
+#define VECT_TAB_OFFSET  0x4000 /*!< Vector Table base offset field. 
+                                   App 链接在 0x08004000 (扇区0留给Bootloader),
+                                   向量表基址 = FLASH_BASE(0x08000000) + 0x4000. */
 /******************************************************************************/
 
 /************************* PLL Parameters *************************************/

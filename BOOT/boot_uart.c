@@ -29,6 +29,29 @@ void boot_uart_init(uint32_t baud)
     USART_Cmd(USART1, ENABLE);
 }
 
+/* 跳转 App 前调用: 关闭并复位 USART1, 让 App 从干净状态重新初始化。
+ * 为什么必须做: 若跳转瞬间 USART1 还停在"发送中"(最后一个字节还在移位寄存器里),
+ * App 重新配置 USART1 后 TC 标志会永远不再置位, 于是 App 的 printf 卡在
+ * fputc 的 while((USART1->SR&0x40)==0) 死循环 —— 表现为屏幕黑屏、串口除
+ * BOOT 日志外再无任何输出(连 App 的第一条 printf 都发不出来)。 */
+void boot_uart_deinit(void)
+{
+    uint32_t guard;
+
+    /* 等最后一帧发送完成(带 guard 计数, 避免异常时死等) */
+    for (guard = 0; guard < 2000000UL && (USART1->SR & USART_SR_TC) == 0; guard++) { }
+
+    USART1->CR1 = 0;                            /* 关收发和USART使能 */
+
+    RCC->APB2RSTR |=  RCC_APB2RSTR_USART1RST;   /* 复位USART1外设, 清内部状态 */
+    RCC->APB2RSTR &= ~RCC_APB2RSTR_USART1RST;
+
+    RCC->APB2ENR &= ~RCC_APB2ENR_USART1EN;      /* 关时钟, 由App重新使能 */
+
+    /* PA9/PA10 恢复为默认(输入), 避免残留复用配置 */
+    GPIOA->MODER &= ~((3UL << (9 * 2)) | (3UL << (10 * 2)));
+}
+
 void boot_delay_ms(uint32_t ms)
 {
     volatile uint32_t i, j;

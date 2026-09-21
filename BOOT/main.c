@@ -15,8 +15,12 @@
 
 static ota_meta_t s_meta;
 
-#define BOOT_IWDG_PRESCALER  IWDG_Prescaler_64   /* LSI~32kHz/64 = 512Hz */
-#define BOOT_IWDG_RELOAD     1500UL              /* 约3秒超时 */
+/* 分频统一用256, 且超时给足: App 初始化(LCD+LVGL+界面)需要1~3秒,
+ * 若这里只给3秒, 跳转后 App 还没跑完就被复位(黑屏/无输出)。
+ * App 起来后由 wdg_task 把重载值改回 500(约4秒)进入正常监督。
+ * 注意: 分频必须由这里统一设定, App 侧不再改分频。 */
+#define BOOT_IWDG_PRESCALER  IWDG_Prescaler_256  /* LSI~32kHz/256 = 125Hz */
+#define BOOT_IWDG_RELOAD     4095UL              /* 约32.8秒超时 */
 #define BOOT_MAX_TRIALS      3                   /* 新固件试用失败上限 */
 
 /* ---------------- 元数据 ---------------- */
@@ -58,6 +62,10 @@ static void boot_jump_app(void)
     uint32_t pc = *(volatile uint32_t *)(APP_ADDR + 4);
     void (*app_entry)(void) = (void (*)(void))pc;
 
+    /* 跳转前把 BOOT 用过的外设关掉并复位, 否则 App 会继承不正常的外设状态
+       (实测: USART1 停在发送中会让 App 的 printf 死等 TC 标志, 导致黑屏+无输出) */
+    boot_uart_deinit();
+
     __disable_irq();
     __set_MSP(sp);
     __set_CONTROL(0);
@@ -71,9 +79,18 @@ static void boot_jump_app(void)
 
 static void boot_iwdg_start(void)
 {
+    uint32_t guard;
+
+    /* 关键: IWDG 的 PR/RLR 写入后需要等 PVU/RVU 标志清零才算真正生效
+     * (需几个 LSI 周期同步)。若写完立刻 Enable, 分频会停在复位默认值 4 分频,
+     * 超时就从 32 秒变成 4095*4/32000 ≈ 0.5 秒 —— App 还没跑完就被反复复位,
+     * 表现就是屏幕黑屏 + App 没有任何串口输出。
+     * 这里带 guard 计数等待, 避免 LSI 异常时死循环。 */
     IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);
     IWDG_SetPrescaler(BOOT_IWDG_PRESCALER);
+    for (guard = 0; guard < 2000000UL && (IWDG->SR & IWDG_SR_PVU); guard++) { }
     IWDG_SetReload(BOOT_IWDG_RELOAD);
+    for (guard = 0; guard < 2000000UL && (IWDG->SR & IWDG_SR_RVU); guard++) { }
     IWDG_ReloadCounter();
     IWDG_Enable();
 }
@@ -179,6 +196,12 @@ static void boot_install_from_staging(void)
         boot_meta_erase();
         return;
     }
+    /* 安装完成: 擦除元数据扇区可同时清掉 ready_flag(并丢弃槽位B暂存数据),
+       再写回 magic/版本/running_flag, 这样下次启动才会走"试用计数"逻辑,
+       否则每次启动都会重装一遍, 试用失败回滚就永远触发不了。 */
+    boot_meta_erase();
+    boot_meta_write_field(offsetof(ota_meta_t, magic), META_MAGIC);
+    boot_meta_write_field(offsetof(ota_meta_t, app_version), s_meta.app_version);
     boot_meta_write_field(offsetof(ota_meta_t, running_flag), META_FLAG_SET);
     boot_uart_puts("[BOOT] 安装完成,进入试用\r\n");
 }
@@ -231,6 +254,13 @@ int main(void)
     }
 
     boot_iwdg_start();
+    /* 自检: 打印 IWDG 实际生效的分频与重载值, 便于确认配置是否真的写进去了。
+     * 正常应为 PR=4(256分频) RLR=00000FFF(约32.8秒)。 */
+    boot_uart_puts("[BOOT] IWDG PR=");
+    boot_uart_puthex32(IWDG->PR);
+    boot_uart_puts(" RLR=");
+    boot_uart_puthex32(IWDG->RLR);
+    boot_uart_puts("\r\n");
     boot_uart_puts("[BOOT] 启动App @0x08004000\r\n");
     boot_jump_app();
 

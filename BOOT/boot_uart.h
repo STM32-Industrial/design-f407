@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 void boot_uart_init(uint32_t baud);
+void boot_uart_deinit(void);
 void boot_uart_putc(char c);
 void boot_uart_puts(const char *s);
 void boot_uart_puthex32(uint32_t v);
